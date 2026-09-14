@@ -1,0 +1,38 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editors and operating-system files
+.DS_Store
+.idea/
+.vscode/
+
+# Downloaded datasets
+data/
+datasets/
+
+# Training outputs and experiment trackers
+results*/
+*_results*/
+outputs/
+logs/
+checkpoints/
+runs/
+wandb/
+mlruns/
+
+# Generated metrics, logs, and model artifacts
+*.csv
+*.log
+*.out
+*.err
+*.ckpt
+*.pth
+*.pt
+*.npy
+*.npz
