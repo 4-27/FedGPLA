@@ -22,6 +22,8 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler  # [Modified for
 import logging
 import os
 import time
+import json
+import tempfile
 
 
 # ==================== [FedGPLA Start] ====================
@@ -42,6 +44,39 @@ def smoothed_prior(class_counts, smoothing_alpha, num_classes):
         raise ValueError('Prior denominator must be positive')
     # 对每个类别加入 alpha/C，再除以公共分母得到归一化先验。
     return (counts + float(smoothing_alpha) / num_classes) / denominator
+
+
+def unlabeled_class_evidence(average_weak_probability, strong_prediction,
+                             reliability_threshold, ablation_mode):
+    """Construct unit-mass class statistics, independently of training targets."""
+    weak_confidence, weak_prediction = average_weak_probability.max(dim=-1)
+    reliable_mask = (
+        weak_confidence.ge(reliability_threshold)
+        & weak_prediction.eq(strong_prediction)
+    )
+    hard_evidence = F.one_hot(
+        weak_prediction, num_classes=average_weak_probability.size(-1),
+    ).to(average_weak_probability.dtype)
+    if ablation_mode == 'all_hard':
+        return hard_evidence
+    if ablation_mode == 'all_soft':
+        return average_weak_probability
+    # Full, uniform-reference and without-memory use the original hybrid counts.
+    return torch.where(
+        reliable_mask.unsqueeze(1), hard_evidence, average_weak_probability,
+    )
+
+
+def create_run_directory(args):
+    """Allocate an exclusive directory without consuming training RNG state."""
+    run_parent = os.path.join(
+        args.output_dir, args.ablation_mode, args.dataset,
+        f'alpha_{args.alpha}', f'seed_{args.seed}',
+    )
+    os.makedirs(run_parent, exist_ok=True)
+    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+    # mkdtemp creates the directory atomically, even for simultaneous reruns.
+    return tempfile.mkdtemp(prefix=f'run_{timestamp}_', dir=run_parent)
 
 
 class Indices2Dataset_evidence(Dataset):
@@ -118,6 +153,7 @@ class Global(object):
         self.global_prior = None
         # [Modified for FedGPLA] 保存 method 中的全局平滑系数 alpha_g。
         self.alpha_global_prior = args.alpha_global_prior
+        self.ablation_mode = args.ablation_mode
         # ===================== [FedGPLA End] =====================
 
     def fedavg_eval(self, fedavg_params, data_test, batch_size_test):
@@ -147,6 +183,13 @@ class Global(object):
         # 检查第二维必须与当前任务类别数完全一致。
         if memory.dim() != 2 or memory.size(1) != self.num_classes:
             raise ValueError('Labeled-count memory must have shape [K, C]')
+        if self.ablation_mode == 'without_memory':
+            # Share Full's first reference, but retain no per-client history.
+            self.evidence_memory = None
+            self.global_prior = smoothed_prior(
+                memory.sum(dim=0), self.alpha_global_prior, self.num_classes,
+            )
+            return
         # 复制计数作为 warm-up 结束后的初始 A_{k,mem}=n_k^l。
         self.evidence_memory = memory.clone()
         # 用所有缓存计数计算第一轮半监督训练所需的全局参考先验。
@@ -165,12 +208,32 @@ class Global(object):
             self.alpha_global_prior,
             self.num_classes,
         )
+        if self.ablation_mode == 'uniform':
+            # Only the reference used for logit adjustment is replaced.
+            self.global_prior = torch.full(
+                (self.num_classes,), 1.0 / self.num_classes, dtype=torch.float64,
+            )
 
     def update_method_prior(self, client_ids, uploaded_evidence):
-        """只替换本轮参与客户端的缓存，离线客户端缓存保持不变。"""
+        """Build the next round's reference from this round's uploaded evidence."""
+        if self.global_prior is None:
+            raise RuntimeError('Global prior has not been initialized')
         # 每个参与客户端必须且只能上传一个 A_k。
         if len(client_ids) != len(uploaded_evidence):
             raise ValueError('Client ids and uploaded evidence must have equal length')
+        if not len(client_ids) or len(set(client_ids)) != len(client_ids):
+            raise ValueError('A round must contain distinct participating clients')
+        if self.ablation_mode == 'without_memory':
+            round_counts = torch.zeros(self.num_classes, dtype=torch.float64)
+            for client_evidence in uploaded_evidence:
+                evidence = torch.as_tensor(client_evidence, dtype=torch.float64)
+                if evidence.shape != (self.num_classes,):
+                    raise ValueError('Client evidence has an invalid class dimension')
+                round_counts += evidence
+            self.global_prior = smoothed_prior(
+                round_counts, self.alpha_global_prior, self.num_classes,
+            )
+            return
         # 逐客户端执行 A_{k,mem} <- A_k。
         for client_id, client_evidence in zip(client_ids, uploaded_evidence):
             # 将上传证据复制到 CPU float64，便于稳定地累计全局先验。
@@ -333,25 +396,12 @@ class Local(object):
                 _, strong_logits = self.local_model(strong_view)
                 # 取强增强预测类别，用于 method 的强弱一致性判断。
                 strong_prediction = strong_logits.argmax(dim=-1)
-                # 取得平均弱预测的最大概率和对应类别。
-                weak_confidence, weak_prediction = (
-                    average_weak_probability.max(dim=-1)
-                )
-                # 同时满足 tau_r 和强弱类别一致时，m_{k,j}=1。
-                reliable_mask = (
-                    weak_confidence.ge(args.reliability_threshold)
-                    & weak_prediction.eq(strong_prediction)
-                )
-                # 为平均弱预测的 argmax 类别构造 one-hot hard count。
-                hard_evidence = F.one_hot(
-                    weak_prediction,
-                    num_classes=self.num_classes,
-                ).to(average_weak_probability.dtype)
-                # 可靠样本贡献 hard count，其余样本贡献平均弱预测 soft count。
-                sample_evidence = torch.where(
-                    reliable_mask.unsqueeze(1),
-                    hard_evidence,
+                # All variants evaluate the same views and retain each sample's mass.
+                sample_evidence = unlabeled_class_evidence(
                     average_weak_probability,
+                    strong_prediction,
+                    args.reliability_threshold,
+                    args.ablation_mode,
                 )
                 # 将当前 batch 每个样本恰好一次的证据累加到 A_k。
                 local_evidence += sample_evidence.to(torch.float64).sum(dim=0)
@@ -610,21 +660,18 @@ class Local(object):
 def fixmatch(args):
     alpha = args.alpha
 
-    run_root = os.path.join(
-        args.output_dir,
-        args.dataset,
-        f'alpha_{alpha}',
-        f'seed_{args.seed}',
-    )
+    run_root = create_run_directory(args)
     log_dir = os.path.join(run_root, 'logs')
     os.makedirs(log_dir, exist_ok=True)
-    cr_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    log_file = os.path.join(log_dir, '{method}_α={alpha}_{cr_time}.log'.format(method=args.method, alpha = alpha, cr_time=cr_time))
+    log_file = os.path.join(log_dir, 'train.log')
 
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s',
-                        filename=log_file
+                        filename=log_file,
+                        force=True,
                         )
+    print(f'Ablation mode: {args.ablation_mode}; outputs: {run_root}')
+    logging.info('ablation_mode: %s; outputs: %s', args.ablation_mode, run_root)
 
     if args.dataset == 'CIFAR10':
         args.num_classes = 10
@@ -694,6 +741,13 @@ def fixmatch(args):
             batch_unlabel=args.batch_size_local_unlabeled,
         ))
 
+    config = vars(args).copy()
+    config.update(warmup_rounds=FEDGPLA_WARMUP_ROUNDS,
+                  evidence_views=FEDGPLA_EVIDENCE_VIEWS)
+    with open(os.path.join(run_root, 'config.json'), 'w', encoding='utf-8') as stream:
+        json.dump(config, stream, indent=2)
+
+    # This dedicated generator is independent of model predictions and modes.
     random_state = np.random.RandomState(args.seed)
 
     list_label2indices = classify_label(data_local_training, args.num_classes)
@@ -731,6 +785,15 @@ def fixmatch(args):
         copy.deepcopy(indices)
         for indices in list_client2indices_unlabeled
     ]
+    # Save the actual split before labeled examples join the training pool.
+    partition = {
+        'labeled': [[int(i) for i in indices]
+                    for indices in list_client2indices_labeled],
+        'unlabeled': [[int(i) for i in indices]
+                      for indices in list_client2indices_evidence],
+    }
+    with open(os.path.join(run_root, 'partition.json'), 'w', encoding='utf-8') as stream:
+        json.dump(partition, stream)
     # ===================== [FedGPLA End] =====================
 
     # add labeled samples without labels into the unlabeled dataset
@@ -764,7 +827,7 @@ def fixmatch(args):
         # 当前实现将前 10 轮计入总通信预算并用于监督预热。
         is_warmup_round = r <= FEDGPLA_WARMUP_ROUNDS
         # 在第一轮半监督训练开始前，用全部客户端 n_k^l 初始化 cache 与 pi_g。
-        if not is_warmup_round and global_model.evidence_memory is None:
+        if not is_warmup_round and global_model.global_prior is None:
             global_model.initialize_method_prior(all_clients_labeled_counts)
         # 收集本轮参与客户端上传的 A_k，供聚合后更新 memory bank。
         list_local_evidence = []
@@ -773,6 +836,10 @@ def fixmatch(args):
         dict_global_params = global_model.download_params()
 
         online_clients = random_state.choice(total_clients, args.num_online_clients, replace=False)
+        with open(os.path.join(run_root, 'clients.jsonl'), 'a', encoding='utf-8') as stream:
+            stream.write(json.dumps({
+                'round': r, 'clients': [int(client) for client in online_clients],
+            }) + '\n')
         list_dicts_local_params = []
         list_nums_local_data = []
 
@@ -891,22 +958,22 @@ def fixmatch(args):
         os.makedirs(result_dir, exist_ok=True)
 
         # make specific result dir by cdw
-        result_dir_spec = f'{result_dir}/{args.method}_α={alpha}_{cr_time}'
-        os.makedirs(result_dir_spec, exist_ok=True)
+        result_dir_spec = os.path.join(result_dir, 'checkpoints')
 
         if args.save_checkpoints and (
                 r == 1 or r == args.num_rounds
                 or (r % 50 == 0 and r > 0.8 * args.num_rounds)):
+            os.makedirs(result_dir_spec, exist_ok=True)
             torch.save(fedavg_params, f'{result_dir_spec}/fedavg_params_round_{r}.pth')
             print(f"Saved model for round {r}")
 
-        result_file = f'{result_dir}/{args.method}_α={alpha}_{cr_time}.csv'
+        result_file = os.path.join(result_dir, 'accuracy.csv')
         acc_num_pseudo_label_csv_index = list(range(1, len(fedavg_acc)+1))
         acc_num_pseudo_label_csv_df = pd.DataFrame({'acc':fedavg_acc}, index = acc_num_pseudo_label_csv_index)
         # 保存文件
         acc_num_pseudo_label_csv_df.to_csv(result_file, encoding='utf8')
 
-        result_pseudo_file = f'{result_dir}/{args.method}_α={alpha}_pseudo_{cr_time}.csv'
+        result_pseudo_file = os.path.join(result_dir, 'metrics.csv')
         min_length = min(
             len(fedavg_pseudo_acc),
             len(fedavg_valid_ratio),

@@ -4,7 +4,7 @@ import argparse
 import os
 
 
-def args_parser():
+def args_parser(argv=None):
     project_dir = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser(
         description="Reproduce the main FedGPLA results.",
@@ -12,6 +12,12 @@ def args_parser():
     )
 
     parser.add_argument('--method', default='FedGPLA')
+    parser.add_argument(
+        '--ablation_mode',
+        choices=('full', 'all_hard', 'all_soft', 'uniform', 'without_memory'),
+        default='full',
+        help='Prior construction variant; all modes retain GPLA and GGCR',
+    )
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument(
         '--dataset',
@@ -69,7 +75,7 @@ def args_parser():
         help='Save selected global-model checkpoints in addition to CSV metrics',
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.gpu_id < 0:
         parser.error('--gpu_id must be non-negative')
     if args.alpha < 0:

@@ -5,12 +5,15 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATASET="${1:-CIFAR100}"
 ALPHA="${2:-0.1}"
 GPU_ID="${3:-0}"
+ABLATION_MODE="${4:-full}"
+SEED="${5:-7}"
 
 python "$PROJECT_DIR/FedGPLA.py" \
     --dataset "$DATASET" \
     --alpha "$ALPHA" \
     --gpu_id "$GPU_ID" \
-    --seed 7 \
+    --ablation_mode "$ABLATION_MODE" \
+    --seed "$SEED" \
     --num_clients 20 \
     --num_online_clients 8 \
     --local_epochs 5 \
